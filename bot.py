@@ -209,11 +209,16 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
     # 3. 新用户发名片
     if is_new_topic:
-        safe_name = html.escape(user.full_name or user.username or str(uid))
-        mention_link = mention_html(uid, safe_name)
+        safe_name = html.escape(user.full_name or "无名氏")
+        username_text = f"@{user.username}" if user.username else "未设置" # 获取用户名
+        mention_link = mention_html(uid, safe_name) # 原有的跳转链接
+        
         info_text = (
-            f"<b>新用户接入</b>\nID: <code>{uid}</code>\n"
-            f"名字: {mention_link}\n#id{uid}"
+            f"<b>新用户接入</b>\n"
+            f"ID: <code>{uid}</code>\n"
+            f"名字: {mention_link}\n"
+            f"用户名: {username_text}\n" # 新增用户名展示
+            f"#id{uid}"
         )
         try:
             await context.bot.send_message(
