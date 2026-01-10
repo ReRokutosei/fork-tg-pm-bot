@@ -21,7 +21,7 @@
 <img width="437" height="286" alt="image" src="https://github.com/user-attachments/assets/5a16772f-7232-4d5b-b328-7d65fde94b13" />
 
 2.自己查看消息的群组ID（-100开头的）
-创建一个群组，拉自己刚才创建的机器人到自己的群组内，给机器人管理员权限
+创建一个群组，拉自己刚才创建的机器人到自己的群组内，给机器人管理员权限(一定要是私有群组，里面只有你和机器人两个人)
 
 <img width="270" height="340" alt="image" src="https://github.com/user-attachments/assets/9b42820a-b48c-4237-ab85-de1c865bffad" />
 
