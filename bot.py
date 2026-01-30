@@ -269,62 +269,81 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     # 获取文本或图片的附言，用于验证密码
     text_content = msg.text or msg.caption or ""
     
+    print(f"DEBUG: Processing message from user {uid}, message_id: {msg.message_id}")
+    
     async with user_locks[uid]:
+        print(f"DEBUG: Acquired lock for user {uid}")
 
         if uid in banned_users:
+            print(f"DEBUG: User {uid} is banned")
             await msg.reply_text("🚫 你已被管理员禁止发送消息。")
             return
 
         user = update.effective_user
         display = _display_name_from_update(update)
+        
+        print(f"DEBUG: User {uid} is verified: {user_verified.get(uid, False)}, use_math: {USE_MATH_CAPTCHA}, use_fixed: {USE_FIXED_CAPTCHA}")
 
         # 1. 验证流程
         if not user_verified.get(uid):
+            print(f"DEBUG: User {uid} needs verification")
             if USE_MATH_CAPTCHA:
                 # 使用数学验证码验证
                 try:
                     user_answer = int(text_content.strip())
                     correct_answer = math_answers.get(uid)
                     
+                    print(f"DEBUG: Math verification - user input: {user_answer}, expected: {correct_answer}")
                     if user_answer == correct_answer:
                         # 验证成功，清除记录
                         user_verified[uid] = True
                         math_answers.pop(uid, None)  # 清除该用户的数学题答案
                         persist_mapping()
                         await msg.reply_text("验证成功！你现在可以发送消息了。")
+                        print(f"DEBUG: User {uid} verification successful")
                     else:
                         # 重新生成数学题并发送
                         question, answer = _generate_math_question()
                         math_answers[uid] = answer
                         await msg.reply_text(f"答案错误，请重新回答：\n{question}")
+                        print(f"DEBUG: User {uid} gave wrong answer, asking again")
                 except ValueError:
                     # 输入不是有效数字，重新生成题目
                     question, answer = _generate_math_question()
                     math_answers[uid] = answer
                     await msg.reply_text(f"请输入有效数字：\n{question}")
+                    print(f"DEBUG: User {uid} input invalid, asking again")
             elif USE_FIXED_CAPTCHA:
                 # 使用固定验证问题
                 if text_content.strip() == VERIFY_ANSWER:
                     user_verified[uid] = True
                     persist_mapping()
                     await msg.reply_text("验证成功！你现在可以发送消息了。")
+                    print(f"DEBUG: User {uid} fixed verification successful")
                 else:
                     await msg.reply_text("请先通过验证：" + VERIFY_QUESTION)
+                    print(f"DEBUG: User {uid} needs to answer fixed question")
             else:
                 # 无验证模式：自动放行
                 user_verified[uid] = True
                 persist_mapping()
+                print(f"DEBUG: User {uid} auto-verified (no captcha)")
             return
 
+        print(f"DEBUG: User {uid} already verified, proceeding to send message")
+        
         # 2. 确保话题存在
         try:
             thread_id, is_new_topic = await _ensure_thread_for_user(context, uid, display)
+            print(f"DEBUG: Got thread_id {thread_id} for user {uid}, is_new_topic: {is_new_topic}")
         except Exception as e:
+            print(f"ERROR: Failed to ensure thread for user {uid}: {e}")
             await msg.reply_text(f"系统错误：{e}")
             return
 
         # 3. 新用户发名片
         if is_new_topic:
+            print(f"DEBUG: Sending welcome card for user {uid} in thread {thread_id}")
             safe_name = html.escape(user.full_name or "无名氏")
             username_text = f"@{user.username}" if user.username else "未设置" # 获取用户名
             mention_link = mention_html(uid, safe_name) # 原有的跳转链接
@@ -343,10 +362,12 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                     text=info_text,
                     parse_mode=ParseMode.HTML
                 )
-            except Exception:
-                pass
+                print(f"DEBUG: Sent welcome card for user {uid} in thread {thread_id}")
+            except Exception as e:
+                print(f"ERROR: Failed to send welcome card for user {uid}: {e}")
 
         # 4. 转发用户消息，并验证是否真的进入了正确话题
+        print(f"DEBUG: About to forward message from user {uid} to thread {thread_id}")
         try:
             sent_msg = await context.bot.copy_message(
                 chat_id=GROUP_ID,
@@ -355,8 +376,10 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 message_id=msg.message_id
             )
             
+            print(f"DEBUG: Successfully copied message, checking thread_id...")
             # 检查实际 thread_id 是否与预期一致
             actual_thread_id = getattr(sent_msg, 'message_thread_id', None)
+            print(f"DEBUG: Expected thread_id: {thread_id}, Actual thread_id: {actual_thread_id}")
 
             # 检查是否落入 General（说明原话题已失效）
             expected_non_general = (thread_id != 1)
@@ -370,9 +393,11 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 if old_tid:
                     thread_to_user.pop(old_tid, None)
                 persist_mapping()
+                print(f"DEBUG: Cleaned up mappings for user {uid}, old_tid: {old_tid}")
 
                 # 重新创建话题
                 thread_id, is_new_topic = await _ensure_thread_for_user(context, uid, display)
+                print(f"DEBUG: Re-created thread_id {thread_id} for user {uid}, is_new_topic: {is_new_topic}")
 
                 # 如果是新话题，补发用户名片
                 if is_new_topic:
@@ -393,22 +418,29 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                             text=info_text,
                             parse_mode=ParseMode.HTML
                         )
-                    except Exception:
-                        pass
+                        print(f"DEBUG: Sent session restored message for user {uid}")
+                    except Exception as e:
+                        print(f"ERROR: Failed to send session restored message for user {uid}: {e}")
 
                 # 重新发送当前消息到新的话题
+                print(f"DEBUG: Re-forwarding message to new thread {thread_id}")
                 sent_msg = await context.bot.copy_message(
                     chat_id=GROUP_ID,
                     message_thread_id=thread_id,
                     from_chat_id=uid,
                     message_id=msg.message_id
                 )
+                print(f"DEBUG: Message re-forwarded successfully")
 
             #【记录ID】用于编辑同步：(用户ID, 用户消息ID) -> (群组ID, 群组消息ID)（使用最终有效的消息）
             message_map[(uid, msg.message_id)] = (GROUP_ID, sent_msg.message_id, time())
+            print(f"DEBUG: Recorded message mapping for user {uid}, msg_id: {msg.message_id}")
             
         except Exception as e:
+            print(f"ERROR: Failed to forward message from user {uid}: {e}")
             await msg.reply_text(f"消息发送失败：{e}")
+
+    print(f"DEBUG: Finished processing message from user {uid}")
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """群组处理：支持媒体转发"""
