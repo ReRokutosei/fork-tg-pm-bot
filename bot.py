@@ -241,7 +241,20 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         # 【记录ID】用于编辑同步：(用户ID, 用户消息ID) -> (群组ID, 群组消息ID)
         message_map[(uid, msg.message_id)] = (GROUP_ID, sent_msg.message_id)
         
-        await msg.reply_text("已发送。")
+        # 发送"已发送。"消息并存储消息对象
+        confirm_msg = await msg.reply_text("已发送。")
+        
+        # 异步延迟删除确认消息
+        async def delayed_delete():
+            await asyncio.sleep(10)
+            try:
+                await context.bot.delete_message(chat_id=uid, message_id=confirm_msg.message_id)
+            except Exception:
+                pass  # 忽略删除失败的情况
+        
+        # 创建后台任务执行删除
+        asyncio.create_task(delayed_delete())
+        
     except Exception as e:
         await msg.reply_text(f"消息发送失败：{e}")
 
