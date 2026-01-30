@@ -122,30 +122,35 @@ async def _create_topic_for_user(bot, user_id: int, title: str) -> int:
 
 async def _ensure_thread_for_user(context: ContextTypes.DEFAULT_TYPE, user_id: int, display: str):
     print(f"DEBUG: _ensure_thread_for_user called for user {user_id}")
+    print(f"DEBUG: Checking if user {user_id} in user_to_thread map")
+    
     if user_id in user_to_thread:
-        print(f"DEBUG: User {user_id} already has thread {user_to_thread[user_id]}, returning")
-        return user_to_thread[user_id], False 
+        thread_id = user_to_thread[user_id]
+        print(f"DEBUG: User {user_id} already has thread {thread_id}, returning")
+        return thread_id, False 
+    else:
+        print(f"DEBUG: User {user_id} does not have a thread, will create one")
+        # 加锁，同一用户只创建一个话题
+        async with user_locks[user_id]:
+            # 再次检查，以防在等待锁期间其他协程已创建了话题
+            if user_id in user_to_thread:
+                thread_id = user_to_thread[user_id]
+                print(f"DEBUG: User {user_id} already has thread {thread_id} after acquiring lock")
+                return thread_id, False 
 
-    # 加锁，同一用户只创建一个话题
-    async with user_locks[user_id]:
-        # 再次检查，以防在等待锁期间其他协程已创建了话题
-        if user_id in user_to_thread:
-            print(f"DEBUG: User {user_id} already has thread {user_to_thread[user_id]} after acquiring lock")
-            return user_to_thread[user_id], False 
+            print(f"DEBUG: Creating new topic for user {user_id}")
+            try:
+                thread_id = await _create_topic_for_user(context.bot, user_id, f"user_{user_id}_{display}")
+                print(f"DEBUG: Created new topic {thread_id} for user {user_id}")
+            except Exception as e:
+                print(f"ERROR: Failed to create topic for user {user_id}: {e}")
+                raise e
 
-        print(f"DEBUG: Creating new topic for user {user_id}")
-        try:
-            thread_id = await _create_topic_for_user(context.bot, user_id, f"user_{user_id}_{display}")
-            print(f"DEBUG: Created new topic {thread_id} for user {user_id}")
-        except Exception as e:
-            print(f"ERROR: Failed to create topic for user {user_id}: {e}")
-            raise e
-
-        user_to_thread[user_id] = thread_id
-        thread_to_user[thread_id] = user_id
-        persist_mapping()
-        print(f"DEBUG: Stored mapping for user {user_id} -> thread {thread_id}")
-        return thread_id, True
+            user_to_thread[user_id] = thread_id
+            thread_to_user[thread_id] = user_id
+            persist_mapping()
+            print(f"DEBUG: Stored mapping for user {user_id} -> thread {thread_id}")
+            return thread_id, True
 
 def _display_name_from_update(update: Update) -> str:
     u = update.effective_user
