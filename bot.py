@@ -123,16 +123,22 @@ async def _create_topic_for_user(bot, user_id: int, title: str) -> int:
 async def _ensure_thread_for_user(context: ContextTypes.DEFAULT_TYPE, user_id: int, display: str):
     if user_id in user_to_thread:
         return user_to_thread[user_id], False 
-    
-    try:
-        thread_id = await _create_topic_for_user(context.bot, user_id, f"user_{user_id}_{display}")
-    except Exception as e:
-        raise e
 
-    user_to_thread[user_id] = thread_id
-    thread_to_user[thread_id] = user_id
-    persist_mapping()
-    return thread_id, True
+    # 加锁，同一用户只创建一个话题
+    async with user_locks[user_id]:
+        # 再次检查，以防在等待锁期间其他协程已创建了话题
+        if user_id in user_to_thread:
+            return user_to_thread[user_id], False 
+
+        try:
+            thread_id = await _create_topic_for_user(context.bot, user_id, f"user_{user_id}_{display}")
+        except Exception as e:
+            raise e
+
+        user_to_thread[user_id] = thread_id
+        thread_to_user[thread_id] = user_id
+        persist_mapping()
+        return thread_id, True
 
 def _display_name_from_update(update: Update) -> str:
     u = update.effective_user
@@ -368,14 +374,6 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 # 重新创建话题
                 thread_id, is_new_topic = await _ensure_thread_for_user(context, uid, display)
 
-                # 重新转发消息
-                sent_msg = await context.bot.copy_message(
-                    chat_id=GROUP_ID,
-                    message_thread_id=thread_id,
-                    from_chat_id=uid,
-                    message_id=msg.message_id
-                )
-
                 # 如果是新话题，补发用户名片
                 if is_new_topic:
                     safe_name = html.escape(user.full_name or "无名氏")
@@ -397,6 +395,14 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                         )
                     except Exception:
                         pass
+
+                # 重新发送当前消息到新的话题
+                sent_msg = await context.bot.copy_message(
+                    chat_id=GROUP_ID,
+                    message_thread_id=thread_id,
+                    from_chat_id=uid,
+                    message_id=msg.message_id
+                )
 
             #【记录ID】用于编辑同步：(用户ID, 用户消息ID) -> (群组ID, 群组消息ID)（使用最终有效的消息）
             message_map[(uid, msg.message_id)] = (GROUP_ID, sent_msg.message_id, time())
