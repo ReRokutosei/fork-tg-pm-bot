@@ -15,6 +15,7 @@ from telegram.ext import (
 )
 from telegram.helpers import mention_html
 from collections import defaultdict
+import logging
 
 user_locks = defaultdict(asyncio.Lock)
 
@@ -43,15 +44,25 @@ if not BOT_TOKEN:
 if GROUP_ID == 0:
     raise RuntimeError("请设置 GROUP_ID 环境变量")
 
-# ---------- 内存数据 ----------
-# user_id -> message_thread_id
-user_to_thread = {}
-# message_thread_id -> user_id
+
+# ---------- 用户会话管理 ----------
+class UserSession:
+    def __init__(
+        self, user_id, verified=False, thread_id=None, banned=False, verify_time=None
+    ):
+        self.user_id = user_id
+        self.verified = verified
+        self.thread_id = thread_id
+        self.banned = banned
+        self.verify_time = verify_time  # 记录验证时间
+        self.last_activity = time()  # 记录最后活动时间
+
+
+# 存储所有用户会话
+user_sessions = {}
+
+# 话题到用户的映射 (用于通过话题ID查找用户)
 thread_to_user = {}
-# user_id -> bool
-user_verified = {}
-# user_id -> bool (黑名单)
-banned_users = set()
 
 # 【新增】消息映射表 (用于编辑同步)
 # Key: (source_chat_id, source_message_id)
@@ -68,47 +79,68 @@ if PERSIST_FILE.exists():
         content = PERSIST_FILE.read_text(encoding="utf-8")
         if content.strip():
             data = json.loads(content)
-            user_to_thread = {int(k): int(v) for k, v in data.get("user_to_thread", {}).items()}
-            thread_to_user = {int(k): int(v) for k, v in data.get("thread_to_user", {}).items()}
-            user_verified = {int(k): v for k, v in data.get("user_verified", {}).items()}
-            banned_users = set(data.get("banned_users", []))
+            # 重构加载逻辑，兼容旧数据格式
+            user_to_thread_old = {
+                int(k): int(v) for k, v in data.get("user_to_thread", {}).items()
+            }
+            thread_to_user_old = {
+                int(k): int(v) for k, v in data.get("thread_to_user", {}).items()
+            }
+            user_verified_old = {
+                int(k): v for k, v in data.get("user_verified", {}).items()
+            }
+            banned_users_old = set(data.get("banned_users", []))
+
+            # 将旧数据转换为新格式
+            for user_id, thread_id in user_to_thread_old.items():
+                session = UserSession(user_id)
+                session.thread_id = thread_id
+                session.verified = user_verified_old.get(user_id, False)
+                session.banned = user_id in banned_users_old
+                user_sessions[user_id] = session
+
+            # 重建 thread_to_user 映射
+            for user_id, session in user_sessions.items():
+                if session.thread_id:
+                    thread_to_user[session.thread_id] = user_id
+
     except Exception as e:
         print(f"读取数据文件失败: {e}")
-        user_to_thread = {}
-        thread_to_user = {}
-        user_verified = {}
-        banned_users = set()
+        user_sessions = {}
+
 
 def persist_mapping():
     """保存数据到文件"""
+    # 转换回旧格式以保持兼容性
+    user_to_thread = {}
+    thread_to_user = {}
+    user_verified = {}
+    banned_users = []
+
+    for user_id, session in user_sessions.items():
+        if session.thread_id:
+            user_to_thread[user_id] = session.thread_id
+            thread_to_user[session.thread_id] = user_id
+        user_verified[user_id] = session.verified
+        if session.banned:
+            banned_users.append(user_id)
+
     data = {
         "user_to_thread": {str(k): v for k, v in user_to_thread.items()},
         "thread_to_user": {str(k): v for k, v in thread_to_user.items()},
         "user_verified": {str(k): v for k, v in user_verified.items()},
-        "banned_users": list(banned_users),
+        "banned_users": banned_users,
     }
     try:
         if not PERSIST_FILE.parent.exists():
             PERSIST_FILE.parent.mkdir(parents=True, exist_ok=True)
-        PERSIST_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        PERSIST_FILE.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
     except Exception as e:
         print(f"保存数据失败: {e}")
 
 
-async def cleanup_message_map(context: ContextTypes.DEFAULT_TYPE):
-    """清理超过24小时的消息映射记录"""
-    now = time()
-    expired_keys = []
-    for key, value in message_map.items():
-        # value = (dst_chat, dst_msg, timestamp)
-        if now - value[2] > 86400:  # 24小时 = 86400秒
-            expired_keys.append(key)
-    
-    for key in expired_keys:
-        del message_map[key]
-    
-    if expired_keys:
-        print(f"🧹 清理了 {len(expired_keys)} 条过期消息映射")
 # ---------- 辅助函数 ----------
 async def _create_topic_for_user(bot, user_id: int, title: str) -> int:
     safe_title = title[:40]
@@ -120,37 +152,60 @@ async def _create_topic_for_user(bot, user_id: int, title: str) -> int:
         raise RuntimeError("创建 topic 未返回 message_thread_id")
     return int(thread_id)
 
-async def _ensure_thread_for_user(context: ContextTypes.DEFAULT_TYPE, user_id: int, display: str):
-    print(f"DEBUG: _ensure_thread_for_user called for user {user_id}")
-    print(f"DEBUG: Checking if user {user_id} in user_to_thread map")
-    
-    if user_id in user_to_thread:
-        thread_id = user_to_thread[user_id]
-        print(f"DEBUG: User {user_id} already has thread {thread_id}, returning")
-        return thread_id, False 
-    else:
-        print(f"DEBUG: User {user_id} does not have a thread, will create one")
-        # 加锁，同一用户只创建一个话题
-        async with user_locks[user_id]:
-            # 再次检查，以防在等待锁期间其他协程已创建了话题
-            if user_id in user_to_thread:
-                thread_id = user_to_thread[user_id]
-                print(f"DEBUG: User {user_id} already has thread {thread_id} after acquiring lock")
-                return thread_id, False 
 
-            print(f"DEBUG: Creating new topic for user {user_id}")
-            try:
-                thread_id = await _create_topic_for_user(context.bot, user_id, f"user_{user_id}_{display}")
-                print(f"DEBUG: Created new topic {thread_id} for user {user_id}")
-            except Exception as e:
-                print(f"ERROR: Failed to create topic for user {user_id}: {e}")
-                raise e
+async def _verify_topic_validity(bot, thread_id: int) -> bool:
+    """验证话题是否仍然有效"""
+    try:
+        # 尝试向话题发送一条测试消息来验证话题是否有效
+        test_msg = await bot.send_message(
+            chat_id=GROUP_ID,
+            message_thread_id=thread_id,
+            text="​",  # 发送一个不可见的字符作为测试
+            disable_notification=True,
+        )
 
-            user_to_thread[user_id] = thread_id
-            thread_to_user[thread_id] = user_id
-            persist_mapping()
-            print(f"DEBUG: Stored mapping for user {user_id} -> thread {thread_id}")
-            return thread_id, True
+        # 删除测试消息
+        await bot.delete_message(chat_id=GROUP_ID, message_id=test_msg.message_id)
+        return True
+    except Exception as e:
+        # 如果无法向话题发送消息，说明话题可能已被删除
+        print(f"话题 {thread_id} 验证失败: {e}")
+        return False
+
+
+async def _ensure_thread_for_user(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int, display: str
+):
+    """确保用户拥有一个有效的话题"""
+    # 获取或创建用户会话
+    if user_id not in user_sessions:
+        user_sessions[user_id] = UserSession(user_id)
+
+    session = user_sessions[user_id]
+
+    # 如果已有话题ID，验证其有效性
+    if session.thread_id is not None:
+        if await _verify_topic_validity(context.bot, session.thread_id):
+            return session.thread_id, False  # 话题有效，返回现有话题
+        else:
+            # 话题无效，清理旧映射
+            print(f"⚠️ 用户 {user_id} 的话题 {session.thread_id} 已失效，正在清理...")
+            if session.thread_id in thread_to_user:
+                del thread_to_user[session.thread_id]
+            session.thread_id = None
+
+    # 创建新话题
+    thread_id = await _create_topic_for_user(
+        context.bot, user_id, f"user_{user_id}_{display}"
+    )
+
+    # 更新会话和映射
+    session.thread_id = thread_id
+    thread_to_user[thread_id] = user_id
+    persist_mapping()
+
+    return thread_id, True
+
 
 def _display_name_from_update(update: Update) -> str:
     u = update.effective_user
@@ -159,32 +214,36 @@ def _display_name_from_update(update: Update) -> str:
     name = u.full_name or u.username or str(u.id)
     return name.replace("\n", " ")
 
+
 # ---------- 数学验证码辅助函数 ----------
+
 
 def _generate_math_question() -> tuple[str, int]:
     """生成随机数学题及答案"""
     import random
-    op = random.choice(['+', '-', '*', '/'])
-    
-    if op == '+':
+
+    op = random.choice(["+", "-", "*", "/"])
+
+    if op == "+":
         a, b = random.randint(1, 10), random.randint(1, 10)
         return f"{a} + {b} = ?", a + b
-    
-    elif op == '-':
+
+    elif op == "-":
         a, b = random.randint(1, 10), random.randint(1, 10)
         if a < b:
             a, b = b, a
         return f"{a} - {b} = ?", a - b
-    
-    elif op == '*':
+
+    elif op == "*":
         a, b = random.randint(1, 10), random.randint(1, 10)
         return f"{a} × {b} = ?", a * b
-    
+
     else:  # op == '/'
         divisor = random.randint(1, 10)
         quotient = random.randint(1, 10)
         dividend = divisor * quotient
         return f"{dividend} ÷ {divisor} = ?", quotient
+
 
 async def _expire_math_answer(uid: int, delay: int = 300):
     """异步延迟清理数学验证码，delay为延迟时间（秒）"""
@@ -192,8 +251,8 @@ async def _expire_math_answer(uid: int, delay: int = 300):
     # 使用 pop 方法安全地移除，如果不存在也不会报错
     math_answers.pop(uid, None)
 
-# ---------- 命令处理器 ----------
 
+# ---------- 命令处理器 ----------
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
@@ -201,33 +260,48 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.type != "private":
         msg_lines.insert(0, f"📢 群组 ID: <code>{chat.id}</code>")
         if update.effective_message.message_thread_id:
-             msg_lines.append(f"💬 话题 ID: <code>{update.effective_message.message_thread_id}</code>")
+            msg_lines.append(
+                f"💬 话题 ID: <code>{update.effective_message.message_thread_id}</code>"
+            )
     await update.message.reply_text("\n".join(msg_lines), parse_mode=ParseMode.HTML)
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if update.effective_chat.type != "private":
         return
-    if uid in banned_users:
-        return 
-    if user_verified.get(uid):
-        await update.message.reply_text("你已经验证过了，可以直接发送消息（支持文本、图片、视频等）。")
+
+    # 获取或创建用户会话
+    if uid not in user_sessions:
+        user_sessions[uid] = UserSession(uid)
+
+    session = user_sessions[uid]
+
+    if session.banned:
         return
-    
+
+    if session.verified:
+        await update.message.reply_text(
+            "你已经验证过了，可以直接发送消息（支持文本、图片、视频等）。"
+        )
+        return
+
     if USE_MATH_CAPTCHA:
         question, answer = _generate_math_question()
         math_answers[uid] = answer
         await update.message.reply_text(f"请回答数学题完成验证：\n{question}")
-        
+
         # 创建过期任务，5分钟后清理数学答案
         asyncio.create_task(_expire_math_answer(uid))
     elif USE_FIXED_CAPTCHA:
         await update.message.reply_text(VERIFY_QUESTION)
     else:
         # 两者都未启用：自动验证通过
-        user_verified[uid] = True
+        session.verified = True
+        session.verify_time = time()
         persist_mapping()
         await update.message.reply_text("你可以直接发送消息，我会帮你转达。")
+
 
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != GROUP_ID:
@@ -238,16 +312,25 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.effective_message.message_thread_id:
         thread_id = update.effective_message.message_thread_id
         target_uid = thread_to_user.get(thread_id)
-    
+
     if not target_uid:
         await update.message.reply_text("❌ 无法识别目标。请在用户话题内使用或指定ID。")
         return
-    if target_uid in banned_users:
+
+    # 获取或创建用户会话
+    if target_uid not in user_sessions:
+        user_sessions[target_uid] = UserSession(target_uid)
+
+    session = user_sessions[target_uid]
+
+    if session.banned:
         await update.message.reply_text(f"用户 {target_uid} 已经在黑名单中了。")
         return
-    banned_users.add(target_uid)
+
+    session.banned = True
     persist_mapping()
     await update.message.reply_text(f"🚫 用户 {target_uid} 已被封禁。")
+
 
 async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != GROUP_ID:
@@ -258,18 +341,28 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.effective_message.message_thread_id:
         thread_id = update.effective_message.message_thread_id
         target_uid = thread_to_user.get(thread_id)
-    
+
     if not target_uid:
         await update.message.reply_text("❌ 无法识别目标。请在用户话题内使用或指定ID。")
         return
-    if target_uid not in banned_users:
+
+    # 获取或创建用户会话
+    if target_uid not in user_sessions:
+        user_sessions[target_uid] = UserSession(target_uid)
+
+    session = user_sessions[target_uid]
+
+    if not session.banned:
         await update.message.reply_text(f"用户 {target_uid} 不在黑名单中。")
         return
-    banned_users.remove(target_uid)
+
+    session.banned = False
     persist_mapping()
     await update.message.reply_text(f"✅ 用户 {target_uid} 已解封。")
 
+
 # ---------- 消息处理器 (核心功能) ----------
+
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """私聊处理：支持媒体 + 验证 + 自动恢复失效话题"""
@@ -280,35 +373,49 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     msg = update.message
     # 获取文本或图片的附言，用于验证密码
     text_content = msg.text or msg.caption or ""
-    
+
     print(f"DEBUG: Processing message from user {uid}, message_id: {msg.message_id}")
-    
+
     async with user_locks[uid]:
         print(f"DEBUG: Acquired lock for user {uid}")
 
-        if uid in banned_users:
+        # 获取或创建用户会话
+        if uid not in user_sessions:
+            user_sessions[uid] = UserSession(uid)
+
+        session = user_sessions[uid]
+
+        # 更新最后活动时间
+        session.last_activity = time()
+
+        if session.banned:
             print(f"DEBUG: User {uid} is banned")
             await msg.reply_text("🚫 你已被管理员禁止发送消息。")
             return
 
         user = update.effective_user
         display = _display_name_from_update(update)
-        
-        print(f"DEBUG: User {uid} is verified: {user_verified.get(uid, False)}, use_math: {USE_MATH_CAPTCHA}, use_fixed: {USE_FIXED_CAPTCHA}")
+
+        print(
+            f"DEBUG: User {uid} is verified: {session.verified}, use_math: {USE_MATH_CAPTCHA}, use_fixed: {USE_FIXED_CAPTCHA}"
+        )
 
         # 1. 验证流程
-        if not user_verified.get(uid):
+        if not session.verified:
             print(f"DEBUG: User {uid} needs verification")
             if USE_MATH_CAPTCHA:
                 # 使用数学验证码验证
                 try:
                     user_answer = int(text_content.strip())
                     correct_answer = math_answers.get(uid)
-                    
-                    print(f"DEBUG: Math verification - user input: {user_answer}, expected: {correct_answer}")
+
+                    print(
+                        f"DEBUG: Math verification - user input: {user_answer}, expected: {correct_answer}"
+                    )
                     if user_answer == correct_answer:
                         # 验证成功，清除记录
-                        user_verified[uid] = True
+                        session.verified = True
+                        session.verify_time = time()
                         math_answers.pop(uid, None)  # 清除该用户的数学题答案
                         persist_mapping()
                         await msg.reply_text("验证成功！你现在可以发送消息了。")
@@ -328,7 +435,8 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             elif USE_FIXED_CAPTCHA:
                 # 使用固定验证问题
                 if text_content.strip() == VERIFY_ANSWER:
-                    user_verified[uid] = True
+                    session.verified = True
+                    session.verify_time = time()
                     persist_mapping()
                     await msg.reply_text("验证成功！你现在可以发送消息了。")
                     print(f"DEBUG: User {uid} fixed verification successful")
@@ -337,17 +445,22 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                     print(f"DEBUG: User {uid} needs to answer fixed question")
             else:
                 # 无验证模式：自动放行
-                user_verified[uid] = True
+                session.verified = True
+                session.verify_time = time()
                 persist_mapping()
                 print(f"DEBUG: User {uid} auto-verified (no captcha)")
             return
 
         print(f"DEBUG: User {uid} already verified, proceeding to send message")
-        
-        # 2. 确保话题存在
+
+        # 2. 确保话题存在且有效
         try:
-            thread_id, is_new_topic = await _ensure_thread_for_user(context, uid, display)
-            print(f"DEBUG: Got thread_id {thread_id} for user {uid}, is_new_topic: {is_new_topic}")
+            thread_id, is_new_topic = await _ensure_thread_for_user(
+                context, uid, display
+            )
+            print(
+                f"DEBUG: Got thread_id {thread_id} for user {uid}, is_new_topic: {is_new_topic}"
+            )
         except Exception as e:
             print(f"ERROR: Failed to ensure thread for user {uid}: {e}")
             await msg.reply_text(f"系统错误：{e}")
@@ -357,14 +470,16 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         if is_new_topic:
             print(f"DEBUG: Sending welcome card for user {uid} in thread {thread_id}")
             safe_name = html.escape(user.full_name or "无名氏")
-            username_text = f"@{user.username}" if user.username else "未设置" # 获取用户名
-            mention_link = mention_html(uid, safe_name) # 原有的跳转链接
-            
+            username_text = (
+                f"@{user.username}" if user.username else "未设置"
+            )  # 获取用户名
+            mention_link = mention_html(uid, safe_name)  # 原有的跳转链接
+
             info_text = (
                 f"<b>新用户接入</b>\n"
                 f"ID: <code>{uid}</code>\n"
                 f"名字: {mention_link}\n"
-                f"用户名: {username_text}\n" # 新增用户名展示
+                f"用户名: {username_text}\n"  # 新增用户名展示
                 f"#id{uid}"
             )
             try:
@@ -372,7 +487,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                     chat_id=GROUP_ID,
                     message_thread_id=thread_id,
                     text=info_text,
-                    parse_mode=ParseMode.HTML
+                    parse_mode=ParseMode.HTML,
                 )
                 print(f"DEBUG: Sent welcome card for user {uid} in thread {thread_id}")
             except Exception as e:
@@ -385,31 +500,41 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 chat_id=GROUP_ID,
                 message_thread_id=thread_id,
                 from_chat_id=uid,
-                message_id=msg.message_id
+                message_id=msg.message_id,
             )
-            
+
             print(f"DEBUG: Successfully copied message, checking thread_id...")
             # 检查实际 thread_id 是否与预期一致
-            actual_thread_id = getattr(sent_msg, 'message_thread_id', None)
-            print(f"DEBUG: Expected thread_id: {thread_id}, Actual thread_id: {actual_thread_id}")
+            actual_thread_id = getattr(sent_msg, "message_thread_id", None)
+            print(
+                f"DEBUG: Expected thread_id: {thread_id}, Actual thread_id: {actual_thread_id}"
+            )
 
             # 检查是否落入 General（说明原话题已失效）
-            expected_non_general = (thread_id != 1)
-            actually_in_general = (actual_thread_id is None or actual_thread_id == 1)
+            expected_non_general = thread_id != 1
+            actually_in_general = actual_thread_id is None or actual_thread_id == 1
 
             if expected_non_general and actually_in_general:
-                print(f"⚠️ 用户 {uid} 的消息落入 General（预期话题 {thread_id} 已失效），正在重建...")
-                
+                print(
+                    f"⚠️ 用户 {uid} 的消息落入 General（预期话题 {thread_id} 已失效），正在重建..."
+                )
+
                 # 清理旧映射
-                old_tid = user_to_thread.pop(uid, None)
-                if old_tid:
-                    thread_to_user.pop(old_tid, None)
+                session.thread_id = None
+                if thread_id in thread_to_user:
+                    del thread_to_user[thread_id]
                 persist_mapping()
-                print(f"DEBUG: Cleaned up mappings for user {uid}, old_tid: {old_tid}")
+                print(
+                    f"DEBUG: Cleaned up mappings for user {uid}, old_tid: {thread_id}"
+                )
 
                 # 重新创建话题
-                thread_id, is_new_topic = await _ensure_thread_for_user(context, uid, display)
-                print(f"DEBUG: Re-created thread_id {thread_id} for user {uid}, is_new_topic: {is_new_topic}")
+                thread_id, is_new_topic = await _ensure_thread_for_user(
+                    context, uid, display
+                )
+                print(
+                    f"DEBUG: Re-created thread_id {thread_id} for user {uid}, is_new_topic: {is_new_topic}"
+                )
 
                 # 如果是新话题，补发用户名片
                 if is_new_topic:
@@ -428,11 +553,13 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                             chat_id=GROUP_ID,
                             message_thread_id=thread_id,
                             text=info_text,
-                            parse_mode=ParseMode.HTML
+                            parse_mode=ParseMode.HTML,
                         )
                         print(f"DEBUG: Sent session restored message for user {uid}")
                     except Exception as e:
-                        print(f"ERROR: Failed to send session restored message for user {uid}: {e}")
+                        print(
+                            f"ERROR: Failed to send session restored message for user {uid}: {e}"
+                        )
 
                 # 重新发送当前消息到新的话题
                 print(f"DEBUG: Re-forwarding message to new thread {thread_id}")
@@ -440,19 +567,22 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                     chat_id=GROUP_ID,
                     message_thread_id=thread_id,
                     from_chat_id=uid,
-                    message_id=msg.message_id
+                    message_id=msg.message_id,
                 )
                 print(f"DEBUG: Message re-forwarded successfully")
 
-            #【记录ID】用于编辑同步：(用户ID, 用户消息ID) -> (群组ID, 群组消息ID)（使用最终有效的消息）
+            # 【记录ID】用于编辑同步：(用户ID, 用户消息ID) -> (群组ID, 群组消息ID)（使用最终有效的消息）
             message_map[(uid, msg.message_id)] = (GROUP_ID, sent_msg.message_id, time())
-            print(f"DEBUG: Recorded message mapping for user {uid}, msg_id: {msg.message_id}")
-            
+            print(
+                f"DEBUG: Recorded message mapping for user {uid}, msg_id: {msg.message_id}"
+            )
+
         except Exception as e:
             print(f"ERROR: Failed to forward message from user {uid}: {e}")
             await msg.reply_text(f"消息发送失败：{e}")
 
     print(f"DEBUG: Finished processing message from user {uid}")
+
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """群组处理：支持媒体转发"""
@@ -461,44 +591,52 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     thread_id = getattr(msg, "message_thread_id", None)
-    if thread_id is None: return
-    if msg.from_user and msg.from_user.is_bot: return
-    if msg.text and msg.text.startswith("/"): return
+    if thread_id is None:
+        return
+    if msg.from_user and msg.from_user.is_bot:
+        return
+    if msg.text and msg.text.startswith("/"):
+        return
 
     target_user_id = thread_to_user.get(int(thread_id))
-    if not target_user_id: return
+    if not target_user_id:
+        return
 
     # 【修改】管理员回复（使用 copy_message）
     try:
         sent_msg = await context.bot.copy_message(
-            chat_id=target_user_id,
-            from_chat_id=GROUP_ID,
-            message_id=msg.message_id
+            chat_id=target_user_id, from_chat_id=GROUP_ID, message_id=msg.message_id
         )
         # 【记录ID】用于编辑同步：(群组ID, 群组消息ID) -> (用户ID, 用户消息ID)
-        message_map[(GROUP_ID, msg.message_id)] = (target_user_id, sent_msg.message_id, time())
-        
-    except Exception:
-        pass # 如果用户屏蔽了机器人，这里会报错，忽略即可
+        message_map[(GROUP_ID, msg.message_id)] = (
+            target_user_id,
+            sent_msg.message_id,
+            time(),
+        )
+
+    except Exception as e:
+        print(f"ERROR: Could not send message to user {target_user_id}: {e}")
+        pass  # 如果用户屏蔽了机器人，这里会报错，忽略即可
+
 
 async def handle_edit_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """【新增】处理消息编辑同步"""
     edited_msg = update.edited_message
     if not edited_msg:
         return
-    
+
     source_chat_id = edited_msg.chat_id
     source_msg_id = edited_msg.message_id
-    
+
     # 查找对应的目标消息
     target = message_map.get((source_chat_id, source_msg_id))
     if not target:
-        return # 找不到记录（可能是重启前发的，或者没记录上的）
-    
-    target_chat_id, target_msg_id = target
-    
+        return  # 找不到记录（可能是重启前发的，或者没记录上的）
+
+    target_chat_id, target_msg_id = target[:2]  # 提取前两个元素
+
     # 尝试同步编辑内容
-    # 注意：copy_message 生成的是新消息，copy 不支持“再编辑”关联
+    # 注意：copy_message 生成的是新消息，copy 不支持"再编辑"关联
     # 我们只能用 edit_message_text/caption 来修改已发送的消息
     try:
         if edited_msg.text:
@@ -507,7 +645,7 @@ async def handle_edit_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 chat_id=target_chat_id,
                 message_id=target_msg_id,
                 text=edited_msg.text,
-                entities=edited_msg.entities
+                entities=edited_msg.entities,
             )
         elif edited_msg.caption:
             # 媒体说明编辑
@@ -515,7 +653,7 @@ async def handle_edit_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 chat_id=target_chat_id,
                 message_id=target_msg_id,
                 caption=edited_msg.caption,
-                caption_entities=edited_msg.caption_entities
+                caption_entities=edited_msg.caption_entities,
             )
         else:
             # 如果是纯图片/文件修改（Telegram 较少见），或者其他类型，目前 API 处理比较复杂，暂略过
@@ -523,7 +661,24 @@ async def handle_edit_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         print(f"编辑同步失败: {e}")
 
-# ---------- 启动 ----------
+
+# 定义清理函数
+async def cleanup_message_map(context: ContextTypes.DEFAULT_TYPE):
+    """清理超过24小时的消息映射记录"""
+    now = time()
+    expired_keys = []
+    for key, value in message_map.items():
+        # value = (dst_chat, dst_msg, timestamp)
+        if now - value[2] > 86400:  # 24小时 = 86400秒
+            expired_keys.append(key)
+
+    for key in expired_keys:
+        del message_map[key]
+
+    if expired_keys:
+        print(f"🧹 清理了 {len(expired_keys)} 条过期消息映射")
+
+
 def main():
     print("Bot is starting...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -534,29 +689,38 @@ def main():
     app.add_handler(CommandHandler("id", id_command))
 
     # 【新增】编辑消息处理器
-    app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE, handle_edit_message))
+    app.add_handler(
+        MessageHandler(filters.UpdateType.EDITED_MESSAGE, handle_edit_message)
+    )
 
     # 私聊消息：允许所有类型 (去掉 filters.TEXT)，排除命令和状态更新(比如xxx加入群组)
-    app.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.StatusUpdate.ALL, 
-        handle_private_message
-    ))
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
+            handle_private_message,
+        )
+    )
 
     # 群组消息：同上
-    app.add_handler(MessageHandler(
-        filters.Chat(chat_id=GROUP_ID) & ~filters.COMMAND & ~filters.StatusUpdate.ALL, 
-        handle_group_message
-    ))
+    app.add_handler(
+        MessageHandler(
+            filters.Chat(chat_id=GROUP_ID)
+            & ~filters.COMMAND
+            & ~filters.StatusUpdate.ALL,
+            handle_group_message,
+        )
+    )
 
     # 注册每小时清理一次过期消息映射
     app.job_queue.run_repeating(
         callback=cleanup_message_map,
-        interval=3600,   # 每3600秒（1小时）执行一次
-        first=3600       # 启动后1小时首次执行
+        interval=3600,  # 每3600秒（1小时）执行一次
+        first=3600,  # 启动后1小时首次执行
     )
 
     print("Polling started.")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
