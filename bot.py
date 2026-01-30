@@ -154,21 +154,23 @@ async def _create_topic_for_user(bot, user_id: int, title: str) -> int:
 
 
 async def _verify_topic_validity(bot, thread_id: int) -> bool:
-    """验证话题是否仍然有效"""
+    """验证话题是否仍然有效，通过尝试获取话题信息"""
     try:
-        # 尝试向话题发送一条测试消息来验证话题是否有效
+        # 尝试获取话题信息来验证话题是否存在
+        # 目前 Telegram Bot API 没有直接的 get_forum_topic 方法
+        # 所以我们还是要通过发送消息的方式来验证
         test_msg = await bot.send_message(
             chat_id=GROUP_ID,
             message_thread_id=thread_id,
-            text="​",  # 发送一个不可见的字符作为测试
-            disable_notification=True,
+            text="🔍 Topic validation",
+            disable_notification=True
         )
-
+        
         # 删除测试消息
         await bot.delete_message(chat_id=GROUP_ID, message_id=test_msg.message_id)
         return True
     except Exception as e:
-        # 如果无法向话题发送消息，说明话题可能已被删除
+        # 如果无法向话题发送消息，说明话题可能已被删除或无权限
         print(f"话题 {thread_id} 验证失败: {e}")
         return False
 
@@ -185,14 +187,21 @@ async def _ensure_thread_for_user(
 
     # 如果已有话题ID，验证其有效性
     if session.thread_id is not None:
-        if await _verify_topic_validity(context.bot, session.thread_id):
-            return session.thread_id, False  # 话题有效，返回现有话题
+        # 对于新创建的话题，我们跳过验证（避免立即验证新创建的话题）
+        # 只有当话题不是刚刚创建时才验证
+        if not hasattr(session, '_just_created') or not session._just_created:
+            if await _verify_topic_validity(context.bot, session.thread_id):
+                return session.thread_id, False  # 话题有效，返回现有话题
+            else:
+                # 话题无效，清理旧映射
+                print(f"⚠️ 用户 {user_id} 的话题 {session.thread_id} 已失效，正在清理...")
+                if session.thread_id in thread_to_user:
+                    del thread_to_user[session.thread_id]
+                session.thread_id = None
         else:
-            # 话题无效，清理旧映射
-            print(f"⚠️ 用户 {user_id} 的话题 {session.thread_id} 已失效，正在清理...")
-            if session.thread_id in thread_to_user:
-                del thread_to_user[session.thread_id]
-            session.thread_id = None
+            # 如果是刚刚创建的话题，跳过验证
+            delattr(session, '_just_created')
+            return session.thread_id, False
 
     # 创建新话题
     thread_id = await _create_topic_for_user(
@@ -201,6 +210,7 @@ async def _ensure_thread_for_user(
 
     # 更新会话和映射
     session.thread_id = thread_id
+    session._just_created = True  # 标记为刚刚创建
     thread_to_user[thread_id] = user_id
     persist_mapping()
 
