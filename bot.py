@@ -17,11 +17,22 @@ from telegram.helpers import mention_html
 # ---------- 配置（必填环境变量） ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID", "0"))
-VERIFY_QUESTION = os.getenv("VERIFY_QUESTION", "请输入访问密码：")
-VERIFY_ANSWER = os.getenv("VERIFY_ANSWER", "123456")
 
 # 持久化文件路径
 PERSIST_FILE = Path("/data/topic_mapping.json")
+
+# 获取原始环境变量（不设默认值）
+_raw_verify_question = os.getenv("VERIFY_QUESTION")
+_raw_verify_answer = os.getenv("VERIFY_ANSWER")
+_raw_use_math = os.getenv("USE_MATH_CAPTCHA")
+
+# 判断是否启用了相应功能
+USE_MATH_CAPTCHA = _raw_use_math is not None and _raw_use_math.lower() == "true"
+USE_FIXED_CAPTCHA = _raw_verify_answer is not None
+
+# 设置默认值
+VERIFY_QUESTION = _raw_verify_question or "请输入访问密码："
+VERIFY_ANSWER = _raw_verify_answer
 
 if not BOT_TOKEN:
     raise RuntimeError("请设置 BOT_TOKEN 环境变量")
@@ -43,6 +54,9 @@ banned_users = set()
 # Value: (target_chat_id, target_message_id)
 # 仅存在内存中，重启后失效（为了性能不建议持久化所有消息ID）
 message_map = {}
+
+# 数学验证码存储 (用户ID -> 正确答案)
+math_answers = {}
 
 # 启动时加载数据
 if PERSIST_FILE.exists():
@@ -108,6 +122,39 @@ def _display_name_from_update(update: Update) -> str:
     name = u.full_name or u.username or str(u.id)
     return name.replace("\n", " ")
 
+# ---------- 数学验证码辅助函数 ----------
+
+def _generate_math_question() -> tuple[str, int]:
+    """生成随机数学题及答案"""
+    import random
+    op = random.choice(['+', '-', '*', '/'])
+    
+    if op == '+':
+        a, b = random.randint(1, 10), random.randint(1, 10)
+        return f"{a} + {b} = ?", a + b
+    
+    elif op == '-':
+        a, b = random.randint(1, 10), random.randint(1, 10)
+        if a < b:
+            a, b = b, a
+        return f"{a} - {b} = ?", a - b
+    
+    elif op == '*':
+        a, b = random.randint(1, 10), random.randint(1, 10)
+        return f"{a} × {b} = ?", a * b
+    
+    else:  # op == '/'
+        divisor = random.randint(1, 10)
+        quotient = random.randint(1, 10)
+        dividend = divisor * quotient
+        return f"{dividend} ÷ {divisor} = ?", quotient
+
+async def _expire_math_answer(uid: int, delay: int = 300):
+    """异步延迟清理数学验证码，delay为延迟时间（秒）"""
+    await asyncio.sleep(delay)
+    # 使用 pop 方法安全地移除，如果不存在也不会报错
+    math_answers.pop(uid, None)
+
 # ---------- 命令处理器 ----------
 
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -119,6 +166,31 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_message.message_thread_id:
              msg_lines.append(f"💬 话题 ID: <code>{update.effective_message.message_thread_id}</code>")
     await update.message.reply_text("\n".join(msg_lines), parse_mode=ParseMode.HTML)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if update.effective_chat.type != "private":
+        return
+    if uid in banned_users:
+        return 
+    if user_verified.get(uid):
+        await update.message.reply_text("你已经验证过了，可以直接发送消息（支持文本、图片、视频等）。")
+        return
+    
+    if USE_MATH_CAPTCHA:
+        question, answer = _generate_math_question()
+        math_answers[uid] = answer
+        await update.message.reply_text(f"请回答数学题完成验证：\n{question}")
+        
+        # 创建过期任务，5分钟后清理数学答案
+        asyncio.create_task(_expire_math_answer(uid))
+    elif USE_FIXED_CAPTCHA:
+        await update.message.reply_text(VERIFY_QUESTION)
+    else:
+        # 两者都未启用：自动验证通过
+        user_verified[uid] = True
+        persist_mapping()
+        await update.message.reply_text("你可以直接发送消息，我会帮你转达。")
 
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != GROUP_ID:
@@ -162,17 +234,6 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- 消息处理器 (核心功能) ----------
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if update.effective_chat.type != "private":
-        return
-    if uid in banned_users:
-        return 
-    if user_verified.get(uid):
-        await update.message.reply_text("你已经验证过了，可以直接发送消息（支持文本、图片、视频等）。")
-        return
-    await update.message.reply_text(VERIFY_QUESTION)
-
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """私聊处理：支持媒体 + 验证"""
     if update.effective_chat.type != "private":
@@ -192,12 +253,40 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
     # 1. 验证流程
     if not user_verified.get(uid):
-        if text_content.strip() == VERIFY_ANSWER:
+        if USE_MATH_CAPTCHA:
+            # 使用数学验证码验证
+            try:
+                user_answer = int(text_content.strip())
+                correct_answer = math_answers.get(uid)
+                
+                if user_answer == correct_answer:
+                    # 验证成功，清除记录
+                    user_verified[uid] = True
+                    math_answers.pop(uid, None)  # 清除该用户的数学题答案
+                    persist_mapping()
+                    await msg.reply_text("验证成功！你现在可以发送消息了。")
+                else:
+                    # 重新生成数学题并发送
+                    question, answer = _generate_math_question()
+                    math_answers[uid] = answer
+                    await msg.reply_text(f"答案错误，请重新回答：\n{question}")
+            except ValueError:
+                # 输入不是有效数字，重新生成题目
+                question, answer = _generate_math_question()
+                math_answers[uid] = answer
+                await msg.reply_text(f"请输入有效数字：\n{question}")
+        elif USE_FIXED_CAPTCHA:
+            # 使用固定验证问题
+            if text_content.strip() == VERIFY_ANSWER:
+                user_verified[uid] = True
+                persist_mapping()
+                await msg.reply_text("验证成功！你现在可以发送消息了。")
+            else:
+                await msg.reply_text("请先通过验证：" + VERIFY_QUESTION)
+        else:
+            # 无验证模式：自动放行
             user_verified[uid] = True
             persist_mapping()
-            await msg.reply_text("验证成功！你现在可以发送消息了。")
-        else:
-            await msg.reply_text("请先通过验证：" + VERIFY_QUESTION)
         return
 
     # 2. 确保话题存在
