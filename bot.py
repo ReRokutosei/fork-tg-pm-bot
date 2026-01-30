@@ -251,7 +251,7 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- 消息处理器 (核心功能) ----------
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """私聊处理：支持媒体 + 验证"""
+    """私聊处理：支持媒体 + 验证 + 自动恢复失效话题"""
     if update.effective_chat.type != "private":
         return
 
@@ -335,7 +335,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         except Exception:
             pass
 
-    # 4. 【修改】转发用户消息（使用 copy_message 支持所有媒体）
+    # 4. 转发用户消息，并验证是否真的进入了正确话题
     try:
         sent_msg = await context.bot.copy_message(
             chat_id=GROUP_ID,
@@ -343,7 +343,53 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             from_chat_id=uid,
             message_id=msg.message_id
         )
-        # 【记录ID】用于编辑同步：(用户ID, 用户消息ID) -> (群组ID, 群组消息ID)
+
+        # 检查实际 thread_id 是否与预期一致
+        actual_thread_id = getattr(sent_msg, 'message_thread_id', None)
+        if actual_thread_id != thread_id:
+            print(f"⚠️ 话题失效检测：用户 {uid} 的消息未进入预期话题 "
+                  f"(期望 {thread_id}, 实际 {actual_thread_id})，正在重建...")
+
+            # 清理旧映射
+            old_tid = user_to_thread.pop(uid, None)
+            if old_tid:
+                thread_to_user.pop(old_tid, None)
+            persist_mapping()
+
+            # 重新创建话题
+            thread_id, is_new_topic = await _ensure_thread_for_user(context, uid, display)
+
+            # 重新转发消息
+            sent_msg = await context.bot.copy_message(
+                chat_id=GROUP_ID,
+                message_thread_id=thread_id,
+                from_chat_id=uid,
+                message_id=msg.message_id
+            )
+
+            # 如果是新话题，补发用户名片
+            if is_new_topic:
+                safe_name = html.escape(user.full_name or "无名氏")
+                username_text = f"@{user.username}" if user.username else "未设置"
+                mention_link = mention_html(uid, safe_name)
+                info_text = (
+                    f"<b>会话已恢复</b>\n"
+                    f"ID: <code>{uid}</code>\n"
+                    f"名字: {mention_link}\n"
+                    f"用户名: {username_text}\n"
+                    f"#id{uid}"
+                )
+                try:
+                    await context.bot.send_message(
+                        chat_id=GROUP_ID,
+                        message_thread_id=thread_id,
+                        text=info_text,
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    pass
+
+        #【记录ID】用于编辑同步：(用户ID, 用户消息ID) -> (群组ID, 群组消息ID)（使用最终有效的消息）
         message_map[(uid, msg.message_id)] = (GROUP_ID, sent_msg.message_id, time())
         
         # 发送"已发送。"消息并存储消息对象
