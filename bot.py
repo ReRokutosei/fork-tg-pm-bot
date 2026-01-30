@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+from time import time
 import html
 from pathlib import Path
 from telegram import Update
@@ -90,6 +91,21 @@ def persist_mapping():
     except Exception as e:
         print(f"保存数据失败: {e}")
 
+
+async def cleanup_message_map(context: ContextTypes.DEFAULT_TYPE):
+    """清理超过24小时的消息映射记录"""
+    now = time()
+    expired_keys = []
+    for key, value in message_map.items():
+        # value = (dst_chat, dst_msg, timestamp)
+        if now - value[2] > 86400:  # 24小时 = 86400秒
+            expired_keys.append(key)
+    
+    for key in expired_keys:
+        del message_map[key]
+    
+    if expired_keys:
+        print(f"🧹 清理了 {len(expired_keys)} 条过期消息映射")
 # ---------- 辅助函数 ----------
 async def _create_topic_for_user(bot, user_id: int, title: str) -> int:
     safe_title = title[:40]
@@ -328,7 +344,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             message_id=msg.message_id
         )
         # 【记录ID】用于编辑同步：(用户ID, 用户消息ID) -> (群组ID, 群组消息ID)
-        message_map[(uid, msg.message_id)] = (GROUP_ID, sent_msg.message_id)
+        message_map[(uid, msg.message_id)] = (GROUP_ID, sent_msg.message_id, time())
         
         # 发送"已发送。"消息并存储消息对象
         confirm_msg = await msg.reply_text("已发送。")
@@ -369,7 +385,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             message_id=msg.message_id
         )
         # 【记录ID】用于编辑同步：(群组ID, 群组消息ID) -> (用户ID, 用户消息ID)
-        message_map[(GROUP_ID, msg.message_id)] = (target_user_id, sent_msg.message_id)
+        message_map[(GROUP_ID, msg.message_id)] = (target_user_id, sent_msg.message_id, time())
         
     except Exception:
         pass # 如果用户屏蔽了机器人，这里会报错，忽略即可
@@ -441,11 +457,15 @@ def main():
         handle_group_message
     ))
 
+    # 注册每小时清理一次过期消息映射
+    app.job_queue.run_repeating(
+        callback=cleanup_message_map,
+        interval=3600,   # 每3600秒（1小时）执行一次
+        first=3600       # 启动后1小时首次执行
+    )
+
     print("Polling started.")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-
-
-
