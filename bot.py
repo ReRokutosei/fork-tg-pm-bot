@@ -632,10 +632,10 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             except Exception as e:
                 print(f"ERROR: Failed to send welcome card for user {uid}: {e}")
 
-        # 4. 转发用户消息，并验证是否真的进入了正确话题
+        # 4. 转发用户消息
         print(f"DEBUG: About to forward message from user {uid} to thread {thread_id}")
         try:
-            # 首先尝试复制消息
+            # 尝试复制消息
             sent_msg = await context.bot.copy_message(
                 chat_id=GROUP_ID,
                 message_thread_id=thread_id,
@@ -650,78 +650,48 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 f"DEBUG: Expected thread_id: {thread_id}, Actual thread_id: {actual_thread_id}"
             )
 
-            # 检查是否落入 General（说明原话题已失效）
-            expected_non_general = thread_id != 1
-            actually_in_general = actual_thread_id is None or actual_thread_id == 1
-
-            # 静默重定向检测：消息被发送到不同于预期话题的其他话题
-            redirected_to_other_topic = (
-                actual_thread_id is not None 
-                and int(actual_thread_id) != int(thread_id) 
-                and int(actual_thread_id) != 1
-            )
-
-            # 如果消息被重定向或发送到了General频道，需要重建话题
-            if expected_non_general and (actually_in_general or redirected_to_other_topic):
-                redirect_info = "General" if actually_in_general else f"话题 {actual_thread_id}"
-                print(
-                    f"⚠️ 用户 {uid} 的消息被重定向到 {redirect_info}（预期话题 {thread_id} 已失效），正在重建..."
-                )
-
-                # 清理旧映射
-                session.thread_id = None
-                if thread_id in thread_to_user:
-                    del thread_to_user[thread_id]
-                # 清除健康缓存
-                if thread_id in thread_health_cache:
-                    del thread_health_cache[thread_id]
-                persist_mapping()
-                print(
-                    f"DEBUG: Cleaned up mappings for user {uid}, old_tid: {thread_id}"
-                )
-
-                # 重新创建话题
-                thread_id, is_new_topic = await _ensure_thread_for_user(
-                    context, uid, display
-                )
-                print(
-                    f"DEBUG: Re-created thread_id {thread_id} for user {uid}, is_new_topic: {is_new_topic}"
-                )
-
-                # 如果是新话题，补发用户名片
-                if is_new_topic:
-                    safe_name = html.escape(user.full_name or "无名氏")
-                    username_text = f"@{user.username}" if user.username else "未设置"
-                    mention_link = mention_html(uid, safe_name)
-                    info_text = (
-                        f"<b>会话已恢复</b>\n"
-                        f"ID: <code>{uid}</code>\n"
-                        f"名字: {mention_link}\n"
-                        f"用户名: {username_text}\n"
-                        f"#id{uid}"
+            # 关键修改：如果消息发送成功（sent_msg不为None），即使actual_thread_id为None，也不要视为失败
+            # 因为copy_message在话题中的行为可能与send_message不同
+            if actual_thread_id is not None:
+                # 如果有实际话题ID，检查是否与预期不符
+                if int(actual_thread_id) != int(thread_id):
+                    print(
+                        f"⚠️ 用户 {uid} 的消息被重定向到话题 {actual_thread_id}（预期话题 {thread_id}），正在重建..."
                     )
-                    try:
-                        await context.bot.send_message(
-                            chat_id=GROUP_ID,
-                            message_thread_id=thread_id,
-                            text=info_text,
-                            parse_mode=ParseMode.HTML,
-                        )
-                        print(f"DEBUG: Sent session restored message for user {uid}")
-                    except Exception as e:
-                        print(
-                            f"ERROR: Failed to send session restored message for user {uid}: {e}"
-                        )
+                    
+                    # 清理旧映射
+                    session.thread_id = None
+                    if thread_id in thread_to_user:
+                        del thread_to_user[thread_id]
+                    # 清除健康缓存
+                    if thread_id in thread_health_cache:
+                        thread_health_cache[thread_id]['healthy'] = False
+                    persist_mapping()
+                    print(
+                        f"DEBUG: Cleaned up mappings for user {uid}, old_tid: {thread_id}"
+                    )
 
-                # 重新发送当前消息到新的话题
-                print(f"DEBUG: Re-forwarding message to new thread {thread_id}")
-                sent_msg = await context.bot.copy_message(
-                    chat_id=GROUP_ID,
-                    message_thread_id=thread_id,
-                    from_chat_id=uid,
-                    message_id=msg.message_id,
-                )
-                print(f"DEBUG: Message re-forwarded successfully")
+                    # 重新创建话题
+                    thread_id, is_new_topic = await _ensure_thread_for_user(
+                        context, uid, display
+                    )
+                    print(
+                        f"DEBUG: Re-created thread_id {thread_id} for user {uid}, is_new_topic: {is_new_topic}"
+                    )
+
+                    # 重新发送当前消息到新的话题
+                    print(f"DEBUG: Re-forwarding message to new thread {thread_id}")
+                    sent_msg = await context.bot.copy_message(
+                        chat_id=GROUP_ID,
+                        message_thread_id=thread_id,
+                        from_chat_id=uid,
+                        message_id=msg.message_id,
+                    )
+                    print(f"DEBUG: Message re-forwarded successfully")
+            else:
+                # 如果actual_thread_id为None，这可能是一个API行为特性，不代表消息发送失败
+                # 消息可能已成功发送到预期话题，只是copy_message的返回值不包含thread_id
+                print(f"DEBUG: Message thread ID is None, but message was sent successfully")
 
             # 【记录ID】用于编辑同步：(用户ID, 用户消息ID) -> (群组ID, 群组消息ID)（使用最终有效的消息）
             message_map[(uid, msg.message_id)] = (GROUP_ID, sent_msg.message_id, time())
