@@ -272,24 +272,70 @@ async def _ensure_thread_for_user(
                 del thread_health_cache[session.thread_id]
             session.thread_id = None
 
-    # 创建新话题
-    thread_id = await _create_topic_for_user(
-        context.bot, user_id, f"user_{user_id}_{display}"
-    )
+    # 最多重试3次
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # 创建新话题
+            thread_id = await _create_topic_for_user(
+                context.bot, user_id, f"user_{user_id}_{display}"
+            )
 
-    # 更新会话和映射
-    session.thread_id = thread_id
-    thread_to_user[thread_id] = user_id
-    persist_mapping()
-    
-    # 更新健康缓存
-    thread_health_cache[thread_id] = {
-        'healthy': True,
-        'timestamp': time(),
-        'probe_result': {'status': 'ok'}
-    }
+            # 等待片刻，确保话题完全创建
+            await asyncio.sleep(0.5)
+            
+            # 立即测试新创建的话题是否可用
+            try:
+                test_msg = await context.bot.send_message(
+                    chat_id=GROUP_ID,
+                    message_thread_id=thread_id,
+                    text="🔍 Test message to verify topic availability",
+                    disable_notification=True
+                )
+                
+                # 检查返回的消息是否在正确的线程中
+                actual_thread_id = getattr(test_msg, 'message_thread_id', None)
+                
+                if actual_thread_id is None or int(actual_thread_id) != int(thread_id):
+                    # 话题可能存在问题，抛出异常让外层处理
+                    raise Exception(f"Topic test failed: expected {thread_id}, got {actual_thread_id}")
+                
+                # 删除测试消息
+                await context.bot.delete_message(
+                    chat_id=GROUP_ID,
+                    message_id=test_msg.message_id
+                )
+                
+                print(f"✅ 话题 {thread_id} 创建并验证成功")
+            except Exception as e:
+                print(f"❌ 新创建的话题 {thread_id} 无法使用 (尝试 {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    # 如果不是最后一次尝试，等待后重试
+                    await asyncio.sleep(1)
+                    continue
+                else:
+                    # 最后一次尝试也失败了，抛出异常
+                    raise e
 
-    return thread_id, True
+            # 更新会话和映射
+            session.thread_id = thread_id
+            thread_to_user[thread_id] = user_id
+            persist_mapping()
+
+            # 更新健康缓存
+            thread_health_cache[thread_id] = {
+                'healthy': True,
+                'timestamp': time(),
+                'probe_result': {'status': 'ok'}
+            }
+
+            return thread_id, True
+            
+        except Exception as e:
+            if attempt == max_retries - 1:  # 最后一次尝试
+                print(f"❌ 创建话题失败，已达到最大重试次数: {e}")
+                raise e
+            # 否则继续下一次循环重试
 
 
 def _display_name_from_update(update: Update) -> str:
@@ -537,6 +583,14 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         print(f"DEBUG: User {uid} already verified, proceeding to send message")
+        
+        # 检查用户名：如果用户没有设置 username，则要求其设置
+        if not user.username:
+            await msg.reply_text(
+                "⚠️ 验证通过，但你的 Telegram 用户名为空。\n"
+                "请先在 Telegram 设置中设置一个 @用户名，否则无法继续使用此服务。"
+            )
+            return
 
         # 2. 确保话题存在且有效
         try:
@@ -677,6 +731,13 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
         except Exception as e:
             print(f"ERROR: Failed to forward message from user {uid}: {e}")
+            
+            # 如果copy_message失败，需要标记当前话题为不健康并清理session中的thread_id
+            if session.thread_id:
+                if session.thread_id in thread_health_cache:
+                    thread_health_cache[session.thread_id]['healthy'] = False
+                # 清理session中的thread_id，以便下次重新创建
+                session.thread_id = None
             
             # 如果copy_message失败，尝试发送错误信息给用户
             try:
