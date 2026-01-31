@@ -156,6 +156,7 @@ async def _create_topic_for_user(bot, user_id: int, title: str) -> int:
 # 话题健康检查缓存，减少频繁探测请求
 thread_health_cache = {}
 
+
 async def _probe_forum_thread(bot, expected_thread_id, user_id, reason="health_check"):
     """
     探测话题是否仍然存在且有效
@@ -166,19 +167,16 @@ async def _probe_forum_thread(bot, expected_thread_id, user_id, reason="health_c
             chat_id=GROUP_ID,
             message_thread_id=expected_thread_id,
             text="🔍",  # 探测消息
-            disable_notification=True
+            disable_notification=True,
         )
 
-        actual_thread_id = getattr(result, 'message_thread_id', None)
-        probe_message_id = getattr(result, 'message_id', None)
+        actual_thread_id = getattr(result, "message_thread_id", None)
+        probe_message_id = getattr(result, "message_id", None)
 
         # 尽可能清理探测消息（无论落到哪个话题/General）
         if probe_message_id:
             try:
-                await bot.delete_message(
-                    chat_id=GROUP_ID,
-                    message_id=probe_message_id
-                )
+                await bot.delete_message(chat_id=GROUP_ID, message_id=probe_message_id)
             except Exception:
                 # 删除失败不影响主流程
                 pass
@@ -186,32 +184,36 @@ async def _probe_forum_thread(bot, expected_thread_id, user_id, reason="health_c
         if actual_thread_id is None:
             # 话题可能已失效，消息被重定向到General
             return {"status": "missing_thread_id"}
-        
+
         if int(actual_thread_id) != int(expected_thread_id):
             # 消息被重定向到其他话题
             return {"status": "redirected", "actual_thread_id": actual_thread_id}
-        
+
         # 话题健康状态良好
         return {"status": "ok"}
-    
+
     except Exception as e:
         error_desc = str(e).lower()
-        
+
         # 检查是否是话题不存在的错误
-        if ("thread not found" in error_desc or 
-            "topic not found" in error_desc or
-            "message thread not found" in error_desc or
-            "topic deleted" in error_desc or
-            "thread deleted" in error_desc or
-            "forum topic not found" in error_desc or
-            "topic closed permanently" in error_desc):
+        if (
+            "thread not found" in error_desc
+            or "topic not found" in error_desc
+            or "message thread not found" in error_desc
+            or "topic deleted" in error_desc
+            or "thread deleted" in error_desc
+            or "forum topic not found" in error_desc
+            or "topic closed permanently" in error_desc
+        ):
             return {"status": "missing", "description": str(e)}
-        
+
         # 检查是否是消息内容为空的错误
-        if ("message text is empty" in error_desc or
-            "bad request: message text is empty" in error_desc):
+        if (
+            "message text is empty" in error_desc
+            or "bad request: message text is empty" in error_desc
+        ):
             return {"status": "probe_invalid", "description": str(e)}
-        
+
         # 其他未知错误
         return {"status": "unknown_error", "description": str(e)}
 
@@ -222,26 +224,26 @@ async def _verify_topic_health(bot, thread_id, user_id, reason="health_check"):
     """
     cache_key = thread_id
     now = time()
-    
+
     # 检查缓存
     if cache_key in thread_health_cache:
         cached = thread_health_cache[cache_key]
         # 如果缓存时间小于60秒，直接使用缓存
-        if now - cached['timestamp'] < 60:  # 60秒缓存
-            return cached['healthy']
-    
+        if now - cached["timestamp"] < 60:  # 60秒缓存
+            return cached["healthy"]
+
     # 执行探测
     probe_result = await _probe_forum_thread(bot, thread_id, user_id, reason)
-    
-    is_healthy = probe_result['status'] == 'ok'
-    
+
+    is_healthy = probe_result["status"] == "ok"
+
     # 更新缓存
     thread_health_cache[cache_key] = {
-        'healthy': is_healthy,
-        'timestamp': now,
-        'probe_result': probe_result
+        "healthy": is_healthy,
+        "timestamp": now,
+        "probe_result": probe_result,
     }
-    
+
     return is_healthy
 
 
@@ -258,8 +260,10 @@ async def _ensure_thread_for_user(
     # 如果已有话题ID，验证其有效性
     if session.thread_id is not None:
         # 验证话题健康状态
-        is_healthy = await _verify_topic_health(context.bot, session.thread_id, user_id, "ensure_thread")
-        
+        is_healthy = await _verify_topic_health(
+            context.bot, session.thread_id, user_id, "ensure_thread"
+        )
+
         if is_healthy:
             return session.thread_id, False  # 话题有效，返回现有话题
         else:
@@ -283,32 +287,35 @@ async def _ensure_thread_for_user(
 
             # 等待片刻，确保话题完全创建
             await asyncio.sleep(0.5)
-            
+
             # 立即测试新创建的话题是否可用
             try:
                 test_msg = await context.bot.send_message(
                     chat_id=GROUP_ID,
                     message_thread_id=thread_id,
                     text="🔍 Test message to verify topic availability",
-                    disable_notification=True
+                    disable_notification=True,
                 )
-                
+
                 # 检查返回的消息是否在正确的线程中
-                actual_thread_id = getattr(test_msg, 'message_thread_id', None)
-                
+                actual_thread_id = getattr(test_msg, "message_thread_id", None)
+
                 if actual_thread_id is None or int(actual_thread_id) != int(thread_id):
                     # 话题可能存在问题，抛出异常让外层处理
-                    raise Exception(f"Topic test failed: expected {thread_id}, got {actual_thread_id}")
-                
+                    raise Exception(
+                        f"Topic test failed: expected {thread_id}, got {actual_thread_id}"
+                    )
+
                 # 删除测试消息
                 await context.bot.delete_message(
-                    chat_id=GROUP_ID,
-                    message_id=test_msg.message_id
+                    chat_id=GROUP_ID, message_id=test_msg.message_id
                 )
-                
+
                 print(f"✅ 话题 {thread_id} 创建并验证成功")
             except Exception as e:
-                print(f"❌ 新创建的话题 {thread_id} 无法使用 (尝试 {attempt + 1}/{max_retries}): {e}")
+                print(
+                    f"❌ 新创建的话题 {thread_id} 无法使用 (尝试 {attempt + 1}/{max_retries}): {e}"
+                )
                 if attempt < max_retries - 1:
                     # 如果不是最后一次尝试，等待后重试
                     await asyncio.sleep(1)
@@ -324,13 +331,13 @@ async def _ensure_thread_for_user(
 
             # 更新健康缓存
             thread_health_cache[thread_id] = {
-                'healthy': True,
-                'timestamp': time(),
-                'probe_result': {'status': 'ok'}
+                "healthy": True,
+                "timestamp": time(),
+                "probe_result": {"status": "ok"},
             }
 
             return thread_id, True
-            
+
         except Exception as e:
             if attempt == max_retries - 1:  # 最后一次尝试
                 print(f"❌ 创建话题失败，已达到最大重试次数: {e}")
@@ -583,7 +590,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         print(f"DEBUG: User {uid} already verified, proceeding to send message")
-        
+
         # 检查用户名：如果用户没有设置 username，则要求其设置
         if not user.username:
             await msg.reply_text(
@@ -658,14 +665,14 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                     print(
                         f"⚠️ 用户 {uid} 的消息被重定向到话题 {actual_thread_id}（预期话题 {thread_id}），正在重建..."
                     )
-                    
+
                     # 清理旧映射
                     session.thread_id = None
                     if thread_id in thread_to_user:
                         del thread_to_user[thread_id]
                     # 清除健康缓存
                     if thread_id in thread_health_cache:
-                        thread_health_cache[thread_id]['healthy'] = False
+                        thread_health_cache[thread_id]["healthy"] = False
                     persist_mapping()
                     print(
                         f"DEBUG: Cleaned up mappings for user {uid}, old_tid: {thread_id}"
@@ -691,7 +698,9 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             else:
                 # 如果actual_thread_id为None，这可能是一个API行为特性，不代表消息发送失败
                 # 消息可能已成功发送到预期话题，只是copy_message的返回值不包含thread_id
-                print(f"DEBUG: Message thread ID is None, but message was sent successfully")
+                print(
+                    f"DEBUG: Message thread ID is None, but message was sent successfully"
+                )
 
             # 【记录ID】用于编辑同步：(用户ID, 用户消息ID) -> (群组ID, 群组消息ID)（使用最终有效的消息）
             message_map[(uid, msg.message_id)] = (GROUP_ID, sent_msg.message_id, time())
@@ -701,14 +710,14 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
         except Exception as e:
             print(f"ERROR: Failed to forward message from user {uid}: {e}")
-            
+
             # 如果copy_message失败，需要标记当前话题为不健康并清理session中的thread_id
             if session.thread_id:
                 if session.thread_id in thread_health_cache:
-                    thread_health_cache[session.thread_id]['healthy'] = False
+                    thread_health_cache[session.thread_id]["healthy"] = False
                 # 清理session中的thread_id，以便下次重新创建
                 session.thread_id = None
-            
+
             # 如果copy_message失败，尝试发送错误信息给用户
             try:
                 await msg.reply_text(f"消息发送失败：{e}")
