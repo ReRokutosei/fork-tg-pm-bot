@@ -4,9 +4,9 @@ import sys
 from pathlib import Path
 
 def main():
-    bot = Path("bot.py")
+    bot = Path("src") / "bot.py"
     if not bot.exists():
-        print("❌ bot.py not found.", file=sys.stderr)
+        print("❌ src/bot.py not found.", file=sys.stderr)
         sys.exit(1)
 
     # 显式使用当前 Python 环境调用 black
@@ -18,7 +18,7 @@ def main():
             cwd=Path(__file__).parent  # 确保工作目录正确
         )
         if result.returncode == 0:
-            print("✅ Formatted bot.py")
+            print("✅ Formatted src/bot.py")
         else:
             print("❌ black error:", result.stderr, file=sys.stderr)
             sys.exit(1)
