@@ -1,5 +1,16 @@
 # Telegram 私聊转发机器人（PM Forwarder Bot）
 
+> [!TIP]
+> 相对于 [原项目（1ad5a1b）](https://github.com/ReRokutosei/fork-tg-pm-bot/commit/1ad5a1b2091dc5004db6e317308cd15986d2337c)，本 fork **主要变更**
+> - 引入简单的数学验证防骚扰
+> - 为消息编辑映射添加 24 小时自动清理
+> - 移除“已发送”提示，仅失败时反馈
+> - 自动恢复被误删除的用户话题（也不再会落入 General）
+> - 简化 Dockerfile 的 pip 安装命令
+> - 整理项目目录结构
+> - 添加 MIT 许可证
+> - 将文档图片改为文件引用，并补充部分文档说明
+
 本项目是基于 Python 的 Telegram 机器人。其核心目标是将用户对机器人的私聊消息自动转发至指定管理群，并支持在管理群内对该用户进行直接回复。该模式近似于轻量级客服工单系统，适用于需要集中管理私聊会话的场景。
 
 <img width="1015" height="941" alt="Overview" src="./images/cover.png" />
@@ -56,12 +67,18 @@
 
 #### 获取群组 ID 的方法
 
-方法 A（Windows 客户端）  
+方法 A（Windows 客户端） 
+
 在 Windows 客户端打开群组信息页即可看到群组 ID（需要手动添加 `-100` 前缀），例如 `-100113320xxxxx`。
 
 <img width="1018" height="923" alt="Group ID in Windows" src="./images/group-id-windows.png" />
 
-方法 B（通过 /id 命令）  
+方法 B（第三方客户端） 
+
+第三方客户端可以直接看到群组ID。安卓端可使用 Nagram X，Windows端推荐 AyuGram
+
+方法 C（通过 /id 命令） 
+
 邀请临时机器人进入群组并发送 `/id`，即可显示群组 ID。
 
 <img width="389" height="606" alt="ID Command" src="./images/group-id-bot-command.png" />
@@ -75,7 +92,7 @@
 将本仓库 Fork 至你的 GitHub 账号。
 
 ### 2）在 Zeabur 创建项目
-登录 Zeabur，依次执行：
+[点击登录 Zeabur](https://zeabur.com/referral?referralCode=ReRokutosei&utm_source=ReRokutosei&utm_campaign=oss)，依次执行：
 
 1. Create New Project
 2. 选择共享集群
