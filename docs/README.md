@@ -1,5 +1,10 @@
 # Telegram 私聊转发机器人（PM Forwarder Bot）
 
+> [!Caution]
+> **本项目不再维护**
+>
+> 推荐查看另一个基于 CloudFlare Worker 的项目 **[fork-telegram_private_chatbot](https://github.com/ReRokutosei/fork-telegram_private_chatbot)**
+
 > [!TIP]
 > 相对于 [原项目（1ad5a1b）](https://github.com/ReRokutosei/fork-tg-pm-bot/commit/1ad5a1b2091dc5004db6e317308cd15986d2337c)，本 fork **主要变更**
 > - 引入简单的数学验证防骚扰
